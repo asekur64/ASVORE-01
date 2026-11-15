@@ -1,0 +1,44 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-canvas: #FAF8F5;
+    --bg-surface: #F2EFE9;
+    --bg-card: #FFFFFF;
+    --ink-primary: #111113;
+    --ink-muted: #5C5B57;
+    --accent-gold: #B89352;
+    --accent-gold-hover: #9C7A3D;
+    --border-hairline: rgba(17, 17, 19, 0.09);
+  }
+
+  html {
+    font-family: 'Plus Jakarta Sans', 'Noto Sans Bengali', system-ui, -apple-system, sans-serif;
+    scroll-behavior: smooth;
+    background-color: var(--bg-canvas);
+    color: var(--ink-primary);
+  }
+
+  .font-display {
+    font-family: 'Cormorant Garamond', 'Noto Sans Bengali', Georgia, serif;
+  }
+
+  .font-mono-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

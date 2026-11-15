@@ -1,0 +1,6 @@
+{
+  "name": "ASVORE",
+  "description": "ASVORE – Premium Men's Fashion & Accessories in Bangladesh. Luxury menswear, watches, leather belts, wallets, sunglasses, and lifestyle essentials.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
