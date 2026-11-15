@@ -358,7 +358,7 @@ export function HomePage() {
               {t(UI_TEXT.home.testimonials, lang)}
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {siteSettings.testimonials.map((item) => (
+              {(siteSettings.testimonials || []).map((item) => (
                 <blockquote
                   key={item.id}
                   className="p-6 bg-[#FAF8F5] border border-[#111113]/8 flex flex-col justify-between gap-5"

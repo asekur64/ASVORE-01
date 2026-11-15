@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { Component, type ErrorInfo, type ReactNode, useEffect } from 'react';
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { AppProvider, useApp } from './context/AppContext.tsx';
 import { Header } from './components/Header.tsx';
@@ -16,6 +16,38 @@ import { LoginPage } from './pages/LoginPage.tsx';
 import { DashboardPage } from './pages/DashboardPage.tsx';
 import { ContentPage } from './pages/ContentPage.tsx';
 import { AdminPage } from './pages/admin/AdminPage.tsx';
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; message: string }> {
+  state = { hasError: false, message: '' };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, message: error?.message || 'Unexpected rendering error' };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('ASVORE render error:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#FAF8F5] text-[#111113] flex flex-col items-center justify-center p-6 text-center space-y-4">
+          <span className="font-display text-3xl font-bold tracking-[0.2em]">ASVORE</span>
+          <h1 className="font-display text-2xl font-semibold">We encountered a display issue</h1>
+          <p className="text-sm text-[#5C5B57] max-w-md">{this.state.message}</p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="px-6 py-2.5 bg-[#111113] text-[#FAF8F5] text-xs font-semibold uppercase tracking-wider cursor-pointer"
+          >
+            Reload Storefront
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function AppShell() {
   const { siteSettings, isAdmin, lang } = useApp();
@@ -91,10 +123,12 @@ function AppShell() {
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <AppProvider>
-        <AppShell />
-      </AppProvider>
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AppProvider>
+          <AppShell />
+        </AppProvider>
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }

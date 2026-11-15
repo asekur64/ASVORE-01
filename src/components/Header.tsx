@@ -32,10 +32,10 @@ export function Header() {
     return products
       .filter(
         (p) =>
-          p.nameEn.toLowerCase().includes(q) ||
-          p.nameBn.toLowerCase().includes(q) ||
-          p.sku.toLowerCase().includes(q) ||
-          p.brand.toLowerCase().includes(q)
+          (p.nameEn || '').toLowerCase().includes(q) ||
+          (p.nameBn || '').toLowerCase().includes(q) ||
+          (p.sku || '').toLowerCase().includes(q) ||
+          (p.brand || '').toLowerCase().includes(q)
       )
       .slice(0, 5);
   }, [searchQuery, products]);

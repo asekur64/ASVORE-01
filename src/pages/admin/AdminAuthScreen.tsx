@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { sendPasswordResetEmail } from 'firebase/auth';
 import { ArrowLeft, KeyRound, Lock, Mail, Moon, ShieldCheck, Sun } from 'lucide-react';
 import { useApp } from '../../context/AppContext.tsx';
+import { auth } from '../../lib/firebase.ts';
 import { ADMIN_TEXT, t } from '../../lib/i18n.ts';
 
 interface AdminAuthScreenProps {
@@ -76,12 +78,25 @@ export function AdminAuthScreen({ dark, onToggleDark, onAuditLogin }: AdminAuthS
         showToast(data.error || 'Could not generate reset token', 'error');
         return;
       }
+      if (data.clientEmailFlow) {
+        await sendPasswordResetEmail(auth, email.trim());
+        showToast(
+          lang === 'bn'
+            ? 'আপনার ইমেইলে পাসওয়ার্ড রিসেট লিংক পাঠানো হয়েছে।'
+            : 'Password reset link has been sent to your email inbox.',
+          'success'
+        );
+        setMode('login');
+        return;
+      }
       if (data.resetToken) {
         setGeneratedTokenPreview(data.resetToken);
         setResetToken(data.resetToken);
       }
       showToast(lang === 'bn' ? data.messageBn : data.messageEn, 'success');
       setMode('reset');
+    } catch (err: any) {
+      showToast(err?.message || 'Could not send reset email', 'error');
     } finally {
       setBusy(false);
     }

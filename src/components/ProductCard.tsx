@@ -54,9 +54,9 @@ export function ProductCard({ product }: { product: Product }) {
       <div className="p-4 flex-1 flex flex-col justify-between gap-3">
         <div>
           <div className="flex items-center gap-2 text-xs text-[#5C5B57] mb-1">
-            <span className="uppercase tracking-wider">{product.brand}</span>
+            <span className="uppercase tracking-wider">{product.brand || 'ASVORE'}</span>
             <span aria-hidden="true">·</span>
-            <span className="tabular-nums">{product.ratingAvg.toFixed(1)} ★</span>
+            <span className="tabular-nums">{Number(product.ratingAvg ?? 5).toFixed(1)} ★</span>
           </div>
           <Link
             to={`/product/${product.slug}`}

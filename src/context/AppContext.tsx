@@ -331,6 +331,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const data = (await res.json()) as { isAdmin: boolean; role: AdminRole | 'customer' };
           setIsAdmin(Boolean(data.isAdmin));
           setAdminRole(data.isAdmin ? (data.role as AdminRole) : null);
+          if (data.isAdmin) {
+            fetch('/api/bootstrap', {
+              headers: { Authorization: `Bearer ${token}` },
+            }).catch(() => {});
+          }
         }
       } catch {
         setIsAdmin(false);

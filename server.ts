@@ -3,10 +3,6 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
-import { initializeApp as initializeAdminApp, getApps as getAdminApps } from 'firebase-admin/app';
-import { getAuth as getAdminAuth } from 'firebase-admin/auth';
-import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
-import firebaseConfig from './firebase-applet-config.json' with { type: 'json' };
 import {
   SEED_CATEGORIES,
   SEED_COUPONS,
@@ -16,18 +12,20 @@ import {
   SEED_SITE_SETTINGS,
 } from './src/lib/seedData.ts';
 import { isValidBdPhone, normalizeBdPhone } from './src/lib/bangladeshGeo.ts';
+import {
+  adminAuth,
+  canUseAdminSdk,
+  extractBearerToken,
+  getServerDb,
+  ServerFieldValue,
+  type ServerDb,
+  verifyFirebaseIdToken,
+} from './serverDb.ts';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOOTSTRAP_SUPER_ADMIN_EMAIL = 'asekurr60@gmail.com';
-
-const adminApp = getAdminApps().length
-  ? getAdminApps()[0]
-  : initializeAdminApp({ projectId: firebaseConfig.projectId });
-
-const adminAuth = getAdminAuth(adminApp);
-const adminDb = getAdminFirestore(adminApp, firebaseConfig.firestoreDatabaseId);
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -76,25 +74,15 @@ interface AuthedUser {
 
 interface AuthedRequest extends express.Request {
   authUser?: AuthedUser;
+  authToken?: string;
   adminRole?: string;
 }
 
 async function extractOptionalUser(req: express.Request): Promise<AuthedUser | null> {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) return null;
-  const token = header.slice('Bearer '.length).trim();
+  const token = extractBearerToken(req);
   if (!token) return null;
-  try {
-    const decoded = await adminAuth.verifyIdToken(token);
-    return {
-      uid: decoded.uid,
-      email: decoded.email || '',
-      emailVerified: Boolean(decoded.email_verified),
-      name: decoded.name || '',
-    };
-  } catch {
-    return null;
-  }
+  (req as AuthedRequest).authToken = token;
+  return verifyFirebaseIdToken(token);
 }
 
 async function requireAuth(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
@@ -120,65 +108,96 @@ function requireAdmin(allowedRoles: string[]) {
       next();
       return;
     }
-    const adminSnap = await adminDb.collection('admins').doc(user.uid).get();
-    if (!adminSnap.exists) {
-      res.status(403).json({ error: 'Forbidden: Admin access required' });
-      return;
+    try {
+      const db = await getServerDb(req.authToken);
+      const adminSnap = await db.collection('admins').doc(user.uid).get();
+      if (!adminSnap.exists) {
+        res.status(403).json({ error: 'Forbidden: Admin access required' });
+        return;
+      }
+      const data = adminSnap.data() || {};
+      if (!data.active || !allowedRoles.includes(String(data.role))) {
+        res.status(403).json({ error: 'Forbidden: Insufficient role permissions' });
+        return;
+      }
+      req.adminRole = String(data.role);
+      next();
+    } catch {
+      res.status(403).json({ error: 'Forbidden: Admin verification failed' });
     }
-    const data = adminSnap.data() || {};
-    if (!data.active || !allowedRoles.includes(String(data.role))) {
-      res.status(403).json({ error: 'Forbidden: Insufficient role permissions' });
-      return;
-    }
-    req.adminRole = String(data.role);
-    next();
   };
 }
 
 let seededOnce = false;
-async function ensureSeeded() {
-  if (seededOnce) return;
+async function ensureSeeded(idToken?: string): Promise<boolean> {
+  if (seededOnce) return true;
   try {
-    const prodSnap = await adminDb.collection('products').limit(1).get();
+    const hasSdk = await canUseAdminSdk();
+    const db = await getServerDb(idToken);
+    const prodSnap = await db.collection('products').where('published', '==', true).limit(1).get();
+
+    // Check whether caller can write seed data if database is empty
+    let canWriteSeed = hasSdk;
+    if (!canWriteSeed && idToken) {
+      const actor = await verifyFirebaseIdToken(idToken);
+      if (actor) {
+        if (actor.email === BOOTSTRAP_SUPER_ADMIN_EMAIL && actor.emailVerified) {
+          canWriteSeed = true;
+        } else {
+          const adminDoc = await db.collection('admins').doc(actor.uid).get().catch(() => null);
+          canWriteSeed = Boolean(adminDoc?.exists && adminDoc.data()?.active);
+        }
+      }
+    }
+
     if (prodSnap.empty) {
-      const batch = adminDb.batch();
+      if (!canWriteSeed) {
+        // Wait cleanly until an admin signs in or service account credentials are provided
+        return false;
+      }
+      const batch = db.batch();
       for (const cat of SEED_CATEGORIES) {
-        batch.set(adminDb.collection('categories').doc(cat.id), {
+        batch.set(db.collection('categories').doc(cat.id), {
           ...cat,
           createdAt: new Date().toISOString(),
         });
       }
       for (const prod of SEED_PRODUCTS) {
-        batch.set(adminDb.collection('products').doc(prod.id), {
+        batch.set(db.collection('products').doc(prod.id), {
           ...prod,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         });
       }
       for (const coupon of SEED_COUPONS) {
-        batch.set(adminDb.collection('coupons').doc(coupon.id), {
+        batch.set(db.collection('coupons').doc(coupon.id), {
           ...coupon,
           createdAt: new Date().toISOString(),
         });
       }
-      batch.set(adminDb.collection('settings').doc('site'), SEED_SITE_SETTINGS);
-      batch.set(adminDb.collection('settings').doc('shipping'), SEED_SHIPPING);
-      batch.set(adminDb.collection('settings').doc('payment_gateways_public'), SEED_GATEWAY_FLAGS);
+      batch.set(db.collection('settings').doc('site'), SEED_SITE_SETTINGS);
+      batch.set(db.collection('settings').doc('shipping'), SEED_SHIPPING);
+      batch.set(db.collection('settings').doc('payment_gateways_public'), SEED_GATEWAY_FLAGS);
       await batch.commit();
-    } else {
-      // Ensure essential settings docs exist
+      seededOnce = true;
+      return true;
+    }
+
+    if (canWriteSeed) {
       const [siteDoc, shipDoc, gwDoc] = await Promise.all([
-        adminDb.collection('settings').doc('site').get(),
-        adminDb.collection('settings').doc('shipping').get(),
-        adminDb.collection('settings').doc('payment_gateways_public').get(),
+        db.collection('settings').doc('site').get(),
+        db.collection('settings').doc('shipping').get(),
+        db.collection('settings').doc('payment_gateways_public').get(),
       ]);
-      if (!siteDoc.exists) await adminDb.collection('settings').doc('site').set(SEED_SITE_SETTINGS);
-      if (!shipDoc.exists) await adminDb.collection('settings').doc('shipping').set(SEED_SHIPPING);
-      if (!gwDoc.exists) await adminDb.collection('settings').doc('payment_gateways_public').set(SEED_GATEWAY_FLAGS);
+      if (!siteDoc.exists) await db.collection('settings').doc('site').set(SEED_SITE_SETTINGS);
+      if (!shipDoc.exists) await db.collection('settings').doc('shipping').set(SEED_SHIPPING);
+      if (!gwDoc.exists) await db.collection('settings').doc('payment_gateways_public').set(SEED_GATEWAY_FLAGS);
     }
     seededOnce = true;
+    return true;
   } catch (err) {
-    console.error('Seed check error:', err);
+    console.warn('Seed sync skipped:', err instanceof Error ? err.message : err);
+    return false;
   }
 }
 
@@ -191,9 +210,15 @@ function getBaseUrl(req: express.Request): string {
   return `${proto}://${host}`;
 }
 
-async function getGatewayCredentials() {
-  const privSnap = await adminDb.collection('settings_private').doc('payment_gateways').get();
-  const saved = privSnap.exists ? privSnap.data() || {} : {};
+async function getGatewayCredentials(db?: ServerDb) {
+  let saved: Record<string, any> = {};
+  try {
+    const client = db || (await getServerDb());
+    const privSnap = await client.collection('settings_private').doc('payment_gateways').get();
+    saved = privSnap.exists ? privSnap.data() || {} : {};
+  } catch {
+    saved = {};
+  }
   return {
     sslcommerz: {
       storeId: saved.sslcommerzStoreId || process.env.SSLCOMMERZ_STORE_ID || '',
@@ -226,11 +251,13 @@ async function createUserNotification(
     bodyEn: string;
     bodyBn: string;
     orderNumber?: string;
-  }
+  },
+  db?: ServerDb
 ) {
   if (!userId) return;
   try {
-    await adminDb
+    const client = db || (await getServerDb());
+    await client
       .collection('users')
       .doc(userId)
       .collection('notifications')
@@ -240,33 +267,37 @@ async function createUserNotification(
         createdAt: new Date().toISOString(),
       });
   } catch (err) {
-    console.error('Notification write failed:', err);
+    console.warn('Notification write skipped:', err instanceof Error ? err.message : err);
   }
 }
 
-async function createAdminNotification(payload: {
-  type:
-    | 'new_order'
-    | 'new_customer'
-    | 'payment_received'
-    | 'payment_failed'
-    | 'low_stock'
-    | 'order_cancelled'
-    | 'refund_request';
-  titleEn: string;
-  titleBn: string;
-  bodyEn: string;
-  bodyBn: string;
-  recordId?: string;
-}) {
+async function createAdminNotification(
+  payload: {
+    type:
+      | 'new_order'
+      | 'new_customer'
+      | 'payment_received'
+      | 'payment_failed'
+      | 'low_stock'
+      | 'order_cancelled'
+      | 'refund_request';
+    titleEn: string;
+    titleBn: string;
+    bodyEn: string;
+    bodyBn: string;
+    recordId?: string;
+  },
+  db?: ServerDb
+) {
   try {
-    await adminDb.collection('admin_notifications').add({
+    const client = db || (await getServerDb());
+    await client.collection('admin_notifications').add({
       ...payload,
       read: false,
       createdAt: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('Admin notification write failed:', err);
+    console.warn('Admin notification write skipped:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -278,7 +309,8 @@ async function writeAuditLog(
 ) {
   try {
     const actor = req.authUser;
-    await adminDb.collection('audit_logs').add({
+    const db = await getServerDb(req.authToken);
+    await db.collection('audit_logs').add({
       adminUid: actor?.uid || 'system',
       adminEmail: actor?.email || 'system',
       adminName: actor?.name || actor?.email || 'Administrator',
@@ -288,7 +320,7 @@ async function writeAuditLog(
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('Audit log write failed:', err);
+    console.warn('Audit log write skipped:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -297,9 +329,10 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'asvore-api' });
 });
 
-app.get('/api/bootstrap', async (_req, res) => {
-  await ensureSeeded();
-  res.json({ ok: true });
+app.get('/api/bootstrap', async (req, res) => {
+  const token = extractBearerToken(req);
+  const seeded = await ensureSeeded(token);
+  res.json({ ok: true, seeded });
 });
 
 // Dynamic Sitemap & Robots for SEO
@@ -313,13 +346,13 @@ app.get('/robots.txt', (req, res) => {
 app.get('/sitemap.xml', async (req, res) => {
   await ensureSeeded();
   const baseUrl = getBaseUrl(req);
-  const prods = await adminDb.collection('products').where('published', '==', true).get();
+  const db = await getServerDb();
+  const prods = await db.collection('products').where('published', '==', true).get();
+  const list = prods.docs.length > 0 ? prods.docs.map((d) => d.data()!) : SEED_PRODUCTS;
   const staticUrls = ['', '/shop', '/track-order', '/about', '/contact'];
   const urls = [
     ...staticUrls.map((u) => `<url><loc>${baseUrl}${u}</loc><changefreq>weekly</changefreq></url>`),
-    ...prods.docs.map(
-      (d) => `<url><loc>${baseUrl}/product/${d.data().slug}</loc><changefreq>daily</changefreq></url>`
-    ),
+    ...list.map((p) => `<url><loc>${baseUrl}/product/${p.slug}</loc><changefreq>daily</changefreq></url>`),
   ].join('');
   res.type('application/xml').send(
     `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}</urlset>`
@@ -329,19 +362,29 @@ app.get('/sitemap.xml', async (req, res) => {
 // Server-side Coupon Validation
 app.post('/api/coupons/validate', rateLimit(30, 60_000), async (req, res) => {
   try {
-    await ensureSeeded();
+    const token = extractBearerToken(req);
+    await ensureSeeded(token);
+    const db = await getServerDb(token);
     const code = sanitizeText(req.body?.code, 40).toUpperCase();
     const subtotal = Number(req.body?.subtotal || 0);
     if (!code) {
       res.status(400).json({ error: 'Coupon code is required', errorBn: 'কুপন কোড লিখুন' });
       return;
     }
-    const snap = await adminDb.collection('coupons').where('code', '==', code).limit(1).get();
-    if (snap.empty) {
+    let coupon: any = null;
+    const directDoc = await db.collection('coupons').doc(`coupon-${code.toLowerCase()}`).get().catch(() => null);
+    if (directDoc?.exists) {
+      coupon = directDoc.data();
+    } else if (await canUseAdminSdk()) {
+      const snap = await db.collection('coupons').where('code', '==', code).limit(1).get();
+      if (!snap.empty) coupon = snap.docs[0].data();
+    } else {
+      coupon = SEED_COUPONS.find((c) => c.code.toUpperCase() === code) || null;
+    }
+    if (!coupon) {
       res.status(404).json({ error: 'Invalid coupon code', errorBn: 'অবৈধ কুপন কোড' });
       return;
     }
-    const coupon = snap.docs[0].data();
     if (!coupon.active) {
       res.status(400).json({ error: 'Coupon is inactive', errorBn: 'এই কুপনটি সক্রিয় নয়' });
       return;
@@ -383,8 +426,19 @@ app.post('/api/coupons/validate', rateLimit(30, 60_000), async (req, res) => {
 // Server-Authoritative Order Placement & Official Gateway Dispatch
 app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
   try {
-    await ensureSeeded();
     const authedUser = await extractOptionalUser(req);
+    const token = (req as AuthedRequest).authToken;
+    await ensureSeeded(token);
+    const hasSdk = await canUseAdminSdk();
+    if (!hasSdk && !authedUser) {
+      res.status(401).json({
+        errorCode: 'AUTH_REQUIRED',
+        error: 'Please sign in to complete your order.',
+        errorBn: 'অর্ডার সম্পন্ন করতে অনুগ্রহ করে সাইন ইন করুন।',
+      });
+      return;
+    }
+    const db = await getServerDb(token);
     const body = req.body || {};
     const customerName = sanitizeText(body.customerName, 120);
     const customerPhone = normalizeBdPhone(sanitizeText(body.customerPhone, 30));
@@ -412,7 +466,7 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     }
 
     // Check gateway availability
-    const gwFlagsSnap = await adminDb.collection('settings').doc('payment_gateways_public').get();
+    const gwFlagsSnap = await db.collection('settings').doc('payment_gateways_public').get();
     const gwFlags = gwFlagsSnap.exists ? gwFlagsSnap.data() || {} : SEED_GATEWAY_FLAGS;
     const allowedMethods = ['cod', 'bkash', 'nagad', 'rocket', 'upay', 'sslcommerz', 'card'];
     if (!allowedMethods.includes(paymentMethod)) {
@@ -435,12 +489,13 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     for (const rawItem of rawItems) {
       const productId = sanitizeText(rawItem?.productId, 128);
       const quantity = Math.max(1, Math.min(20, Math.floor(Number(rawItem?.quantity || 1))));
-      const prodDoc = await adminDb.collection('products').doc(productId).get();
-      if (!prodDoc.exists) {
+      const prodDoc = await db.collection('products').doc(productId).get();
+      const seedFallback = !prodDoc.exists ? SEED_PRODUCTS.find((sp) => sp.id === productId) : null;
+      if (!prodDoc.exists && !seedFallback) {
         res.status(400).json({ error: `Product not found: ${productId}` });
         return;
       }
-      const p = prodDoc.data()!;
+      const p = prodDoc.exists ? prodDoc.data()! : (seedFallback as any);
       if (!p.published) {
         res.status(400).json({ error: `Product unavailable: ${p.nameEn}` });
         return;
@@ -474,10 +529,9 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     let discount = 0;
     let appliedCouponDocId: string | null = null;
     if (couponCode) {
-      const cSnap = await adminDb.collection('coupons').where('code', '==', couponCode).limit(1).get();
-      if (!cSnap.empty) {
-        const cDoc = cSnap.docs[0];
-        const c = cDoc.data();
+      const cDoc = await db.collection('coupons').doc(`coupon-${couponCode.toLowerCase()}`).get().catch(() => null);
+      if (cDoc?.exists) {
+        const c = cDoc.data()!;
         const notExpired = !c.expiresAt || new Date(c.expiresAt).getTime() >= Date.now();
         const underLimit = !c.usageLimit || Number(c.usedCount || 0) < Number(c.usageLimit);
         if (c.active && notExpired && underLimit && subtotal >= Number(c.minOrderAmount || 0)) {
@@ -493,7 +547,7 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     }
 
     // Compute Delivery Charge Server-Side
-    const shipSnap = await adminDb.collection('settings').doc('shipping').get();
+    const shipSnap = await db.collection('settings').doc('shipping').get();
     const ship = shipSnap.exists ? shipSnap.data() || SEED_SHIPPING : SEED_SHIPPING;
     const isGaibandha = district.toLowerCase() === 'gaibandha';
     const deliveryZone = isGaibandha ? 'inside_gaibandha' : 'outside_gaibandha';
@@ -511,14 +565,14 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     }
 
     // Tax calculation from site settings
-    const siteSnap = await adminDb.collection('settings').doc('site').get();
+    const siteSnap = await db.collection('settings').doc('site').get();
     const siteData = siteSnap.exists ? siteSnap.data() || {} : {};
     const taxRate = Number(siteData.taxRatePercent || 0);
     const taxAmount = taxRate > 0 ? Math.round(((subtotal - discount) * taxRate) / 100) : 0;
     const grandTotal = Math.max(0, subtotal - discount + deliveryCharge + taxAmount);
 
     // Check online payment gateway readiness BEFORE creating order if online method selected
-    const creds = await getGatewayCredentials();
+    const creds = await getGatewayCredentials(db);
     const baseUrl = getBaseUrl(req);
     const orderNumber = `ASV-${new Date().toISOString().slice(2, 7).replace('-', '')}-${crypto
       .randomBytes(3)
@@ -561,29 +615,31 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     }
 
     const nowIso = new Date().toISOString();
-    const orderId = adminDb.collection('orders').doc().id;
+    const orderId = db.collection('orders').doc().id;
 
     // Atomically write order & decrement stock
-    await adminDb.runTransaction(async (tx) => {
+    await db.runTransaction(async (tx) => {
       for (const item of orderItems) {
-        const pRef = adminDb.collection('products').doc(item.productId);
+        const pRef = db.collection('products').doc(item.productId);
         const pSnap = await tx.get(pRef);
-        const curStock = Number(pSnap.data()?.stock || 0);
-        if (curStock < item.quantity) {
-          throw new Error(`Out of stock: ${item.nameEn}`);
+        if (pSnap.exists) {
+          const curStock = Number(pSnap.data()?.stock || 0);
+          if (curStock < item.quantity) {
+            throw new Error(`Out of stock: ${item.nameEn}`);
+          }
+          tx.update(pRef, {
+            stock: curStock - item.quantity,
+            soldCount: ServerFieldValue.increment(item.quantity),
+            updatedAt: nowIso,
+          });
         }
-        tx.update(pRef, {
-          stock: curStock - item.quantity,
-          soldCount: FieldValue.increment(item.quantity),
-          updatedAt: nowIso,
-        });
       }
       if (appliedCouponDocId) {
-        tx.update(adminDb.collection('coupons').doc(appliedCouponDocId), {
-          usedCount: FieldValue.increment(1),
+        tx.update(db.collection('coupons').doc(appliedCouponDocId), {
+          usedCount: ServerFieldValue.increment(1),
         });
       }
-      tx.set(adminDb.collection('orders').doc(orderId), {
+      tx.set(db.collection('orders').doc(orderId), {
         id: orderId,
         orderNumber,
         userId: authedUser?.uid || null,
@@ -631,40 +687,50 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
     });
 
     // Emit admin new-order alert + low stock check
-    await createAdminNotification({
-      type: 'new_order',
-      titleEn: `New Order ${orderNumber}`,
-      titleBn: `নতুন অর্ডার ${orderNumber}`,
-      bodyEn: `${customerName} placed a ৳${grandTotal} order via ${paymentMethod.toUpperCase()}.`,
-      bodyBn: `${customerName} ${paymentMethod.toUpperCase()} মাধ্যমে ৳${grandTotal} টাকার অর্ডার করেছেন।`,
-      recordId: orderId,
-    });
+    await createAdminNotification(
+      {
+        type: 'new_order',
+        titleEn: `New Order ${orderNumber}`,
+        titleBn: `নতুন অর্ডার ${orderNumber}`,
+        bodyEn: `${customerName} placed a ৳${grandTotal} order via ${paymentMethod.toUpperCase()}.`,
+        bodyBn: `${customerName} ${paymentMethod.toUpperCase()} মাধ্যমে ৳${grandTotal} টাকার অর্ডার করেছেন।`,
+        recordId: orderId,
+      },
+      db
+    );
 
     for (const item of orderItems) {
-      const pCheck = await adminDb.collection('products').doc(item.productId).get();
+      const pCheck = await db.collection('products').doc(item.productId).get();
       const pd = pCheck.data();
       if (pd && Number(pd.stock) <= Number(pd.lowStockThreshold || 5)) {
-        await createAdminNotification({
-          type: 'low_stock',
-          titleEn: `Low Stock: ${pd.nameEn}`,
-          titleBn: `সীমিত স্টক: ${pd.nameBn}`,
-          bodyEn: `Only ${pd.stock} unit(s) remaining for SKU ${pd.sku}.`,
-          bodyBn: `SKU ${pd.sku}-এর মাত্র ${pd.stock}টি স্টকে বাকি আছে।`,
-          recordId: item.productId,
-        });
+        await createAdminNotification(
+          {
+            type: 'low_stock',
+            titleEn: `Low Stock: ${pd.nameEn}`,
+            titleBn: `সীমিত স্টক: ${pd.nameBn}`,
+            bodyEn: `Only ${pd.stock} unit(s) remaining for SKU ${pd.sku}.`,
+            bodyBn: `SKU ${pd.sku}-এর মাত্র ${pd.stock}টি স্টকে বাকি আছে।`,
+            recordId: item.productId,
+          },
+          db
+        );
       }
     }
 
     // If COD, send notification & complete immediately
     if (paymentMethod === 'cod') {
-      await createUserNotification(authedUser?.uid || null, {
-        type: 'order_confirmation',
-        titleEn: `Order Confirmed: ${orderNumber}`,
-        titleBn: `অর্ডার গৃহীত হয়েছে: ${orderNumber}`,
-        bodyEn: `Your COD order of ৳${grandTotal} has been placed and is awaiting confirmation.`,
-        bodyBn: `আপনার ৳${grandTotal} টাকার ক্যাশ অন ডেলিভারি অর্ডারটি সফলভাবে প্লেস হয়েছে।`,
-        orderNumber,
-      });
+      await createUserNotification(
+        authedUser?.uid || null,
+        {
+          type: 'order_confirmation',
+          titleEn: `Order Confirmed: ${orderNumber}`,
+          titleBn: `অর্ডার গৃহীত হয়েছে: ${orderNumber}`,
+          bodyEn: `Your COD order of ৳${grandTotal} has been placed and is awaiting confirmation.`,
+          bodyBn: `আপনার ৳${grandTotal} টাকার ক্যাশ অন ডেলিভারি অর্ডারটি সফলভাবে প্লেস হয়েছে।`,
+          orderNumber,
+        },
+        db
+      );
       res.json({ ok: true, orderId, orderNumber, paymentMode: 'cod', grandTotal });
       return;
     }
@@ -711,7 +777,7 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
       });
       const sslData = (await sslResp.json()) as any;
       if (sslData?.status !== 'SUCCESS' || !sslData?.GatewayPageURL) {
-        await adminDb.collection('orders').doc(orderId).update({
+        await db.collection('orders').doc(orderId).update({
           paymentStatus: 'failed',
           updatedAt: new Date().toISOString(),
         });
@@ -721,7 +787,7 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
         return;
       }
 
-      await adminDb.collection('payments').doc(orderNumber).set({
+      await db.collection('payments').doc(orderNumber).set({
         id: orderNumber,
         orderId,
         orderNumber,
@@ -793,7 +859,7 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
         return;
       }
 
-      await adminDb.collection('payments').doc(orderNumber).set({
+      await db.collection('payments').doc(orderNumber).set({
         id: orderNumber,
         orderId,
         orderNumber,
@@ -832,7 +898,8 @@ app.post('/api/orders/create', rateLimit(20, 60_000), async (req, res) => {
 
 // SSLCommerz Server-Side Verification Callbacks
 async function verifySslcommerzPayment(valId: string, tranId: string) {
-  const creds = await getGatewayCredentials();
+  const db = await getServerDb();
+  const creds = await getGatewayCredentials(db);
   const validateUrl = creds.sslcommerz.sandbox
     ? 'https://sandbox.sslcommerz.com/validator/api/validationserverAPI.php'
     : 'https://securepay.sslcommerz.com/validator/api/validationserverAPI.php';
@@ -843,11 +910,11 @@ async function verifySslcommerzPayment(valId: string, tranId: string) {
 
   const resp = await fetch(url);
   const data = (await resp.json()) as any;
-  const orderSnap = await adminDb.collection('orders').where('orderNumber', '==', tranId).limit(1).get();
+  const orderSnap = await db.collection('orders').where('orderNumber', '==', tranId).limit(1).get();
   if (orderSnap.empty) return { ok: false };
 
   const orderDoc = orderSnap.docs[0];
-  const orderData = orderDoc.data();
+  const orderData = orderDoc.data()!;
   const validStatus = data?.status === 'VALID' || data?.status === 'VALIDATED';
   const amountMatches = Math.abs(Number(data?.amount || 0) - Number(orderData.grandTotal)) < 1;
 
@@ -857,7 +924,7 @@ async function verifySslcommerzPayment(valId: string, tranId: string) {
       paymentStatus: 'paid',
       orderStatus: 'confirmed',
       transactionId: data.bank_tran_id || valId,
-      timeline: FieldValue.arrayUnion({
+      timeline: ServerFieldValue.arrayUnion({
         status: 'confirmed',
         titleEn: 'Payment Verified & Order Confirmed',
         titleBn: 'পেমেন্ট যাচাই সম্পন্ন ও অর্ডার কনফার্মড',
@@ -867,7 +934,7 @@ async function verifySslcommerzPayment(valId: string, tranId: string) {
       }),
       updatedAt: nowIso,
     });
-    await adminDb.collection('payments').doc(tranId).set(
+    await db.collection('payments').doc(tranId).set(
       {
         status: 'paid',
         transactionId: data.bank_tran_id || valId,
@@ -876,22 +943,29 @@ async function verifySslcommerzPayment(valId: string, tranId: string) {
       },
       { merge: true }
     );
-    await createUserNotification(orderData.userId, {
-      type: 'payment_confirmation',
-      titleEn: `Payment Confirmed: ${tranId}`,
-      titleBn: `পেমেন্ট সফল হয়েছে: ${tranId}`,
-      bodyEn: `Your payment of ৳${orderData.grandTotal} has been verified.`,
-      bodyBn: `আপনার ৳${orderData.grandTotal} টাকার পেমেন্ট সফলভাবে যাচাই হয়েছে।`,
-      orderNumber: tranId,
-    });
-    await createAdminNotification({
-      type: 'payment_received',
-      titleEn: `Payment Verified: ${tranId}`,
-      titleBn: `পেমেন্ট সম্পন্ন: ${tranId}`,
-      bodyEn: `৳${orderData.grandTotal} received via SSLCommerz (Trx: ${data.bank_tran_id || valId}).`,
-      bodyBn: `এসএসএলকমার্জ মাধ্যমে ৳${orderData.grandTotal} পেমেন্ট গৃহীত হয়েছে।`,
-      recordId: orderDoc.id,
-    });
+    await createUserNotification(
+      orderData.userId,
+      {
+        type: 'payment_confirmation',
+        titleEn: `Payment Confirmed: ${tranId}`,
+        titleBn: `পেমেন্ট সফল হয়েছে: ${tranId}`,
+        bodyEn: `Your payment of ৳${orderData.grandTotal} has been verified.`,
+        bodyBn: `আপনার ৳${orderData.grandTotal} টাকার পেমেন্ট সফলভাবে যাচাই হয়েছে।`,
+        orderNumber: tranId,
+      },
+      db
+    );
+    await createAdminNotification(
+      {
+        type: 'payment_received',
+        titleEn: `Payment Verified: ${tranId}`,
+        titleBn: `পেমেন্ট সম্পন্ন: ${tranId}`,
+        bodyEn: `৳${orderData.grandTotal} received via SSLCommerz (Trx: ${data.bank_tran_id || valId}).`,
+        bodyBn: `এসএসএলকমার্জ মাধ্যমে ৳${orderData.grandTotal} পেমেন্ট গৃহীত হয়েছে।`,
+        recordId: orderDoc.id,
+      },
+      db
+    );
     return { ok: true };
   }
   return { ok: false };
@@ -920,18 +994,22 @@ app.post('/api/payments/sslcommerz/ipn', async (req, res) => {
 app.post('/api/payments/sslcommerz/fail', async (req, res) => {
   const tranId = sanitizeText(req.body?.tran_id, 60);
   if (tranId) {
-    const snap = await adminDb.collection('orders').where('orderNumber', '==', tranId).limit(1).get();
-    if (!snap.empty) {
-      await snap.docs[0].ref.update({ paymentStatus: 'failed', updatedAt: new Date().toISOString() });
-      await adminDb.collection('payments').doc(tranId).set({ status: 'failed', updatedAt: new Date().toISOString() }, { merge: true });
-      await createAdminNotification({
-        type: 'payment_failed',
-        titleEn: `Payment Failed: ${tranId}`,
-        titleBn: `পেমেন্ট ব্যর্থ: ${tranId}`,
-        bodyEn: `SSLCommerz transaction failed for order ${tranId}.`,
-        bodyBn: `অর্ডার ${tranId}-এর এসএসএলকমার্জ পেমেন্ট ব্যর্থ হয়েছে।`,
-        recordId: snap.docs[0].id,
-      });
+    const db = await getServerDb();
+    const snap = await db.collection('orders').where('orderNumber', '==', tranId).limit(1).get().catch(() => null);
+    if (snap && !snap.empty) {
+      await snap.docs[0].ref.update({ paymentStatus: 'failed', updatedAt: new Date().toISOString() }).catch(() => {});
+      await db.collection('payments').doc(tranId).set({ status: 'failed', updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+      await createAdminNotification(
+        {
+          type: 'payment_failed',
+          titleEn: `Payment Failed: ${tranId}`,
+          titleBn: `পেমেন্ট ব্যর্থ: ${tranId}`,
+          bodyEn: `SSLCommerz transaction failed for order ${tranId}.`,
+          bodyBn: `অর্ডার ${tranId}-এর এসএসএলকমার্জ পেমেন্ট ব্যর্থ হয়েছে।`,
+          recordId: snap.docs[0].id,
+        },
+        db
+      );
     }
   }
   res.redirect(`/order-confirmation/${encodeURIComponent(tranId || 'unknown')}?payment=failed`);
@@ -953,8 +1031,9 @@ app.get('/api/payments/bkash/callback', async (req, res) => {
     return;
   }
 
+  const db = await getServerDb();
   try {
-    const creds = await getGatewayCredentials();
+    const creds = await getGatewayCredentials(db);
     const bkashBase = creds.bkash.sandbox
       ? 'https://tokenized.sandbox.bka.sh/v1.2.0-beta'
       : 'https://tokenized.pay.bka.sh/v1.2.0-beta';
@@ -980,16 +1059,16 @@ app.get('/api/payments/bkash/callback', async (req, res) => {
     });
     const execJson = (await execRes.json()) as any;
     if (execJson?.transactionStatus === 'Completed' && execJson?.trxID) {
-      const orderSnap = await adminDb.collection('orders').where('orderNumber', '==', orderNumber).limit(1).get();
+      const orderSnap = await db.collection('orders').where('orderNumber', '==', orderNumber).limit(1).get();
       if (!orderSnap.empty) {
         const orderDoc = orderSnap.docs[0];
-        const orderData = orderDoc.data();
+        const orderData = orderDoc.data()!;
         const nowIso = new Date().toISOString();
         await orderDoc.ref.update({
           paymentStatus: 'paid',
           orderStatus: 'confirmed',
           transactionId: execJson.trxID,
-          timeline: FieldValue.arrayUnion({
+          timeline: ServerFieldValue.arrayUnion({
             status: 'confirmed',
             titleEn: 'bKash Payment Verified',
             titleBn: 'বিকাশ পেমেন্ট যাচাই সম্পন্ন',
@@ -999,26 +1078,33 @@ app.get('/api/payments/bkash/callback', async (req, res) => {
           }),
           updatedAt: nowIso,
         });
-        await adminDb.collection('payments').doc(orderNumber).set(
+        await db.collection('payments').doc(orderNumber).set(
           { status: 'paid', transactionId: execJson.trxID, verifiedAt: nowIso },
           { merge: true }
         );
-        await createUserNotification(orderData.userId, {
-          type: 'payment_confirmation',
-          titleEn: `bKash Payment Confirmed: ${orderNumber}`,
-          titleBn: `বিকাশ পেমেন্ট সফল: ${orderNumber}`,
-          bodyEn: `Transaction ${execJson.trxID} verified for ৳${orderData.grandTotal}.`,
-          bodyBn: `৳${orderData.grandTotal} টাকার বিকাশ পেমেন্ট (${execJson.trxID}) যাচাই হয়েছে।`,
-          orderNumber,
-        });
-        await createAdminNotification({
-          type: 'payment_received',
-          titleEn: `bKash Payment Verified: ${orderNumber}`,
-          titleBn: `বিকাশ পেমেন্ট সম্পন্ন: ${orderNumber}`,
-          bodyEn: `৳${orderData.grandTotal} verified via bKash (Trx: ${execJson.trxID}).`,
-          bodyBn: `বিকাশের মাধ্যমে ৳${orderData.grandTotal} পেমেন্ট গৃহীত হয়েছে (${execJson.trxID})।`,
-          recordId: orderDoc.id,
-        });
+        await createUserNotification(
+          orderData.userId,
+          {
+            type: 'payment_confirmation',
+            titleEn: `bKash Payment Confirmed: ${orderNumber}`,
+            titleBn: `বিকাশ পেমেন্ট সফল: ${orderNumber}`,
+            bodyEn: `Transaction ${execJson.trxID} verified for ৳${orderData.grandTotal}.`,
+            bodyBn: `৳${orderData.grandTotal} টাকার বিকাশ পেমেন্ট (${execJson.trxID}) যাচাই হয়েছে।`,
+            orderNumber,
+          },
+          db
+        );
+        await createAdminNotification(
+          {
+            type: 'payment_received',
+            titleEn: `bKash Payment Verified: ${orderNumber}`,
+            titleBn: `বিকাশ পেমেন্ট সম্পন্ন: ${orderNumber}`,
+            bodyEn: `৳${orderData.grandTotal} verified via bKash (Trx: ${execJson.trxID}).`,
+            bodyBn: `বিকাশের মাধ্যমে ৳${orderData.grandTotal} পেমেন্ট গৃহীত হয়েছে (${execJson.trxID})।`,
+            recordId: orderDoc.id,
+          },
+          db
+        );
       }
       res.redirect(`/order-confirmation/${encodeURIComponent(orderNumber)}?payment=verified`);
       return;
@@ -1026,15 +1112,18 @@ app.get('/api/payments/bkash/callback', async (req, res) => {
   } catch (err) {
     console.error('bKash callback error:', err);
   }
-  await adminDb.collection('payments').doc(orderNumber).set({ status: 'failed', updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-  await createAdminNotification({
-    type: 'payment_failed',
-    titleEn: `bKash Payment Failed: ${orderNumber}`,
-    titleBn: `বিকাশ পেমেন্ট ব্যর্থ: ${orderNumber}`,
-    bodyEn: `bKash execution failed for order ${orderNumber}.`,
-    bodyBn: `অর্ডার ${orderNumber}-এর বিকাশ পেমেন্ট ব্যর্থ হয়েছে।`,
-    recordId: orderNumber,
-  });
+  await db.collection('payments').doc(orderNumber).set({ status: 'failed', updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+  await createAdminNotification(
+    {
+      type: 'payment_failed',
+      titleEn: `bKash Payment Failed: ${orderNumber}`,
+      titleBn: `বিকাশ পেমেন্ট ব্যর্থ: ${orderNumber}`,
+      bodyEn: `bKash execution failed for order ${orderNumber}.`,
+      bodyBn: `অর্ডার ${orderNumber}-এর বিকাশ পেমেন্ট ব্যর্থ হয়েছে।`,
+      recordId: orderNumber,
+    },
+    db
+  );
   res.redirect(`/order-confirmation/${encodeURIComponent(orderNumber)}?payment=failed`);
 });
 
@@ -1044,17 +1133,30 @@ app.post('/api/orders/track', rateLimit(30, 60_000), async (req, res) => {
     const orderNumber = sanitizeText(req.body?.orderNumber, 40).toUpperCase();
     const phone = normalizeBdPhone(sanitizeText(req.body?.phone, 30));
     const authedUser = await extractOptionalUser(req);
+    const token = (req as AuthedRequest).authToken;
+    const hasSdk = await canUseAdminSdk();
 
     if (!orderNumber) {
       res.status(400).json({ error: 'Order ID is required', errorBn: 'অর্ডার আইডি দিন' });
       return;
     }
-    const snap = await adminDb.collection('orders').where('orderNumber', '==', orderNumber).limit(1).get();
+    if (!hasSdk && !authedUser) {
+      res.status(401).json({
+        error: 'Please sign in to track your order details.',
+        errorBn: 'অর্ডার ট্র্যাক করতে অনুগ্রহ করে সাইন ইন করুন।',
+      });
+      return;
+    }
+    const db = await getServerDb(token);
+    const q = hasSdk
+      ? db.collection('orders').where('orderNumber', '==', orderNumber).limit(1)
+      : db.collection('orders').where('orderNumber', '==', orderNumber).where('userId', '==', authedUser!.uid).limit(1);
+    const snap = await q.get();
     if (snap.empty) {
       res.status(404).json({ error: 'Order not found', errorBn: 'অর্ডারটি খুঁজে পাওয়া যায়নি' });
       return;
     }
-    const order = snap.docs[0].data();
+    const order = snap.docs[0].data()!;
     const isOwner = authedUser && order.userId && order.userId === authedUser.uid;
     const phoneMatches = phone && normalizeBdPhone(order.customerPhone || '') === phone;
 
@@ -1078,7 +1180,8 @@ app.post('/api/orders/track', rateLimit(30, 60_000), async (req, res) => {
 app.post('/api/orders/:orderId/cancel', requireAuth, async (req: AuthedRequest, res) => {
   try {
     const orderId = sanitizeText(req.params.orderId, 128);
-    const ref = adminDb.collection('orders').doc(orderId);
+    const db = await getServerDb(req.authToken);
+    const ref = db.collection('orders').doc(orderId);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(404).json({ error: 'Order not found' });
@@ -1094,16 +1197,21 @@ app.post('/api/orders/:orderId/cancel', requireAuth, async (req: AuthedRequest, 
       return;
     }
     const nowIso = new Date().toISOString();
-    await adminDb.runTransaction(async (tx) => {
+    await db.runTransaction(async (tx) => {
       for (const item of order.items || []) {
-        tx.update(adminDb.collection('products').doc(item.productId), {
-          stock: FieldValue.increment(item.quantity),
-        });
+        const pRef = db.collection('products').doc(item.productId);
+        const pSnap = await tx.get(pRef);
+        if (pSnap.exists) {
+          tx.update(pRef, {
+            stock: ServerFieldValue.increment(item.quantity),
+            updatedAt: nowIso,
+          });
+        }
       }
       tx.update(ref, {
         orderStatus: 'cancelled',
         stockRestored: true,
-        timeline: FieldValue.arrayUnion({
+        timeline: ServerFieldValue.arrayUnion({
           status: 'cancelled',
           titleEn: 'Cancelled by Customer',
           titleBn: 'গ্রাহক কর্তৃক বাতিলকৃত',
@@ -1112,14 +1220,17 @@ app.post('/api/orders/:orderId/cancel', requireAuth, async (req: AuthedRequest, 
         updatedAt: nowIso,
       });
     });
-    await createAdminNotification({
-      type: 'order_cancelled',
-      titleEn: `Order Cancelled: ${order.orderNumber}`,
-      titleBn: `অর্ডার বাতিল: ${order.orderNumber}`,
-      bodyEn: `${order.customerName} cancelled order ${order.orderNumber}. Stock restored.`,
-      bodyBn: `${order.customerName} অর্ডার ${order.orderNumber} বাতিল করেছেন। স্টক পুনরুদ্ধার হয়েছে।`,
-      recordId: orderId,
-    });
+    await createAdminNotification(
+      {
+        type: 'order_cancelled',
+        titleEn: `Order Cancelled: ${order.orderNumber}`,
+        titleBn: `অর্ডার বাতিল: ${order.orderNumber}`,
+        bodyEn: `${order.customerName} cancelled order ${order.orderNumber}. Stock restored.`,
+        bodyBn: `${order.customerName} অর্ডার ${order.orderNumber} বাতিল করেছেন। স্টক পুনরুদ্ধার হয়েছে।`,
+        recordId: orderId,
+      },
+      db
+    );
     res.json({ ok: true });
   } catch (err) {
     console.error('Cancel order error:', err);
@@ -1135,11 +1246,19 @@ app.post('/api/auth/password-reset-request', rateLimit(5, 15 * 60_000), async (r
       res.status(400).json({ error: 'Email is required' });
       return;
     }
+    if (!(await canUseAdminSdk())) {
+      res.json({
+        ok: true,
+        clientEmailFlow: true,
+        messageEn: 'Password reset instructions have been prepared via Firebase email.',
+        messageBn: 'ফায়ারবেস ইমেইলের মাধ্যমে পাসওয়ার্ড রিসেট নির্দেশনা পাঠানো হয়েছে।',
+      });
+      return;
+    }
     let userRecord = null;
     try {
       userRecord = await adminAuth.getUserByEmail(email);
     } catch {
-      // Return generic success to avoid email enumeration
       res.json({
         ok: true,
         messageEn: 'If an account exists for that email, a reset link has been prepared.',
@@ -1147,9 +1266,10 @@ app.post('/api/auth/password-reset-request', rateLimit(5, 15 * 60_000), async (r
       });
       return;
     }
+    const db = await getServerDb();
     const rawToken = crypto.randomBytes(24).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-    await adminDb.collection('reset_tokens').doc(tokenHash).set({
+    await db.collection('reset_tokens').doc(tokenHash).set({
       uid: userRecord.uid,
       email,
       expiresAt: Date.now() + 15 * 60_000,
@@ -1169,6 +1289,13 @@ app.post('/api/auth/password-reset-request', rateLimit(5, 15 * 60_000), async (r
 
 app.post('/api/auth/password-reset-confirm', rateLimit(10, 15 * 60_000), async (req, res) => {
   try {
+    if (!(await canUseAdminSdk())) {
+      res.status(400).json({
+        error: 'Please use the password reset link sent to your email inbox.',
+        errorBn: 'অনুগ্রহ করে আপনার ইমেইলে পাঠানো রিসেট লিংক ব্যবহার করুন।',
+      });
+      return;
+    }
     const token = sanitizeText(req.body?.token, 128);
     const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
     if (!token || newPassword.length < 8) {
@@ -1178,8 +1305,9 @@ app.post('/api/auth/password-reset-confirm', rateLimit(10, 15 * 60_000), async (
       });
       return;
     }
+    const db = await getServerDb();
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const ref = adminDb.collection('reset_tokens').doc(tokenHash);
+    const ref = db.collection('reset_tokens').doc(tokenHash);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(400).json({ error: 'Invalid or expired reset link.', errorBn: 'রিসেট লিংকটি অবৈধ বা মেয়াদোত্তীর্ণ।' });
@@ -1206,13 +1334,13 @@ app.post('/api/auth/phone-otp-request', requireAuth, rateLimit(5, 10 * 60_000), 
       res.status(400).json({ error: 'Valid Bangladesh mobile number required', errorBn: 'সঠিক বাংলাদেশি মোবাইল নম্বর দিন' });
       return;
     }
+    const db = await getServerDb(req.authToken);
     const code = String(Math.floor(100000 + Math.random() * 900000));
-    await adminDb.collection('phone_otps').doc(req.authUser!.uid).set({
+    await db.collection('phone_otps').doc(req.authUser!.uid).set({
       phone,
       codeHash: crypto.createHash('sha256').update(code).digest('hex'),
       expiresAt: Date.now() + 5 * 60_000,
     });
-    // In production, integrate SMS_API_KEY gateway here
     res.json({
       ok: true,
       smsDispatched: Boolean(process.env.SMS_API_KEY),
@@ -1226,8 +1354,9 @@ app.post('/api/auth/phone-otp-request', requireAuth, rateLimit(5, 10 * 60_000), 
 
 app.post('/api/auth/phone-otp-verify', requireAuth, rateLimit(10, 10 * 60_000), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const code = sanitizeText(req.body?.code, 10);
-    const ref = adminDb.collection('phone_otps').doc(req.authUser!.uid);
+    const ref = db.collection('phone_otps').doc(req.authUser!.uid);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(400).json({ error: 'No verification pending' });
@@ -1243,7 +1372,7 @@ app.post('/api/auth/phone-otp-verify', requireAuth, rateLimit(10, 10 * 60_000), 
       res.status(400).json({ error: 'Incorrect verification code', errorBn: 'ভুল ভেরিফিকেশন কোড' });
       return;
     }
-    await adminDb.collection('users').doc(req.authUser!.uid).set(
+    await db.collection('users').doc(req.authUser!.uid).set(
       { phone: data.phone, phoneVerified: true, updatedAt: new Date().toISOString() },
       { merge: true }
     );
@@ -1260,17 +1389,18 @@ app.post('/api/customers/sync-notify', requireAuth, async (req: AuthedRequest, r
   try {
     const uid = req.authUser!.uid;
     const fullName = sanitizeText(req.body?.fullName, 120) || req.authUser!.name || 'New Customer';
-    const existing = await adminDb.collection('admin_notifications').where('recordId', '==', uid).limit(1).get();
-    if (existing.empty) {
-      await createAdminNotification({
+    const db = await getServerDb(req.authToken);
+    await createAdminNotification(
+      {
         type: 'new_customer',
         titleEn: `New Customer Joined: ${fullName}`,
         titleBn: `নতুন গ্রাহক নিবন্ধিত: ${fullName}`,
         bodyEn: `${fullName} (${req.authUser!.email}) registered an ASVORE account.`,
         bodyBn: `${fullName} (${req.authUser!.email}) একটি ASVORE অ্যাকাউন্ট খুলেছেন।`,
         recordId: uid,
-      });
-    }
+      },
+      db
+    );
     res.json({ ok: true });
   } catch {
     res.json({ ok: true });
@@ -1284,16 +1414,22 @@ app.get('/api/auth/me-role', requireAuth, async (req: AuthedRequest, res) => {
     res.json({ isAdmin: true, role: 'super_admin' });
     return;
   }
-  const snap = await adminDb.collection('admins').doc(user.uid).get();
-  if (snap.exists && snap.data()?.active) {
-    res.json({ isAdmin: true, role: snap.data()?.role || 'admin' });
-    return;
+  try {
+    const db = await getServerDb(req.authToken);
+    const snap = await db.collection('admins').doc(user.uid).get();
+    if (snap.exists && snap.data()?.active) {
+      res.json({ isAdmin: true, role: snap.data()?.role || 'admin' });
+      return;
+    }
+  } catch {
+    // non-admin or missing doc
   }
   res.json({ isAdmin: false, role: 'customer' });
 });
 
 // ADMIN ROUTES & AUDIT LOGGING
 app.post('/api/admin/audit-login', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req: AuthedRequest, res) => {
+  await ensureSeeded(req.authToken);
   await writeAuditLog(req, 'ADMIN_LOGIN', `Admin signed in (${req.adminRole})`, req.authUser!.uid);
   res.json({ ok: true, role: req.adminRole });
 });
@@ -1303,9 +1439,10 @@ app.post('/api/admin/audit-logout', requireAdmin(['super_admin', 'admin', 'order
   res.json({ ok: true });
 });
 
-app.get('/api/admin/audit-logs', requireAdmin(['super_admin', 'admin']), async (_req, res) => {
+app.get('/api/admin/audit-logs', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
-    const snap = await adminDb.collection('audit_logs').limit(250).get();
+    const db = await getServerDb(req.authToken);
+    const snap = await db.collection('audit_logs').limit(250).get();
     const logs = snap.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .sort((a: any, b: any) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
@@ -1316,9 +1453,10 @@ app.get('/api/admin/audit-logs', requireAdmin(['super_admin', 'admin']), async (
   }
 });
 
-app.get('/api/admin/notifications', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (_req, res) => {
+app.get('/api/admin/notifications', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req: AuthedRequest, res) => {
   try {
-    const snap = await adminDb.collection('admin_notifications').limit(100).get();
+    const db = await getServerDb(req.authToken);
+    const snap = await db.collection('admin_notifications').limit(100).get();
     const notifications = snap.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
@@ -1329,22 +1467,26 @@ app.get('/api/admin/notifications', requireAdmin(['super_admin', 'admin', 'order
   }
 });
 
-app.post('/api/admin/notifications/:id/read', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req, res) => {
+app.post('/api/admin/notifications/:id/read', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req: AuthedRequest, res) => {
   const id = sanitizeText(req.params.id, 128);
-  await adminDb.collection('admin_notifications').doc(id).update({ read: true }).catch(() => {});
+  const db = await getServerDb(req.authToken);
+  await db.collection('admin_notifications').doc(id).update({ read: true }).catch(() => {});
   res.json({ ok: true });
 });
 
-app.post('/api/admin/notifications/read-all', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (_req, res) => {
-  const snap = await adminDb.collection('admin_notifications').where('read', '==', false).get();
-  const batch = adminDb.batch();
+app.post('/api/admin/notifications/read-all', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req: AuthedRequest, res) => {
+  const db = await getServerDb(req.authToken);
+  const snap = await db.collection('admin_notifications').where('read', '==', false).get();
+  const batch = db.batch();
   snap.docs.forEach((d) => batch.update(d.ref, { read: true }));
   await batch.commit();
   res.json({ ok: true });
 });
 
-app.get('/api/admin/overview', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req, res) => {
+app.get('/api/admin/overview', requireAdmin(['super_admin', 'admin', 'order_manager', 'product_manager']), async (req: AuthedRequest, res) => {
   try {
+    await ensureSeeded(req.authToken);
+    const db = await getServerDb(req.authToken);
     const range = sanitizeText(req.query?.range, 30) || '30d';
     const startParam = sanitizeText(req.query?.start, 30);
     const endParam = sanitizeText(req.query?.end, 30);
@@ -1377,10 +1519,10 @@ app.get('/api/admin/overview', requireAdmin(['super_admin', 'admin', 'order_mana
     }
 
     const [ordersSnap, usersSnap, productsSnap, paymentsSnap] = await Promise.all([
-      adminDb.collection('orders').get(),
-      adminDb.collection('users').get(),
-      adminDb.collection('products').get(),
-      adminDb.collection('payments').get(),
+      db.collection('orders').get(),
+      db.collection('users').get(),
+      db.collection('products').get(),
+      db.collection('payments').get(),
     ]);
 
     const allOrders = ordersSnap.docs.map((d) => d.data());
@@ -1579,9 +1721,10 @@ app.get('/api/admin/overview', requireAdmin(['super_admin', 'admin', 'order_mana
   }
 });
 
-app.get('/api/admin/orders', requireAdmin(['super_admin', 'admin', 'order_manager']), async (_req, res) => {
+app.get('/api/admin/orders', requireAdmin(['super_admin', 'admin', 'order_manager']), async (req: AuthedRequest, res) => {
   try {
-    const snap = await adminDb.collection('orders').get();
+    const db = await getServerDb(req.authToken);
+    const snap = await db.collection('orders').get();
     const orders = snap.docs
       .map((d) => d.data())
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -1594,8 +1737,9 @@ app.get('/api/admin/orders', requireAdmin(['super_admin', 'admin', 'order_manage
 
 app.get('/api/admin/orders/export-csv', requireAdmin(['super_admin', 'admin', 'order_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const statusFilter = sanitizeText(req.query?.status, 40) || 'all';
-    const snap = await adminDb.collection('orders').get();
+    const snap = await db.collection('orders').get();
     let orders = snap.docs.map((d) => d.data()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
     if (statusFilter !== 'all') {
       orders = orders.filter((o) => o.orderStatus === statusFilter);
@@ -1655,8 +1799,9 @@ app.get('/api/admin/orders/export-csv', requireAdmin(['super_admin', 'admin', 'o
 
 app.post('/api/admin/orders/:orderId/update', requireAdmin(['super_admin', 'admin', 'order_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const orderId = sanitizeText(req.params.orderId, 128);
-    const ref = adminDb.collection('orders').doc(orderId);
+    const ref = db.collection('orders').doc(orderId);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(404).json({ error: 'Order not found' });
@@ -1756,18 +1901,22 @@ app.post('/api/admin/orders/:orderId/update', requireAdmin(['super_admin', 'admi
         timestamp: nowIso,
       });
 
-      await createUserNotification(existing.userId, {
-        type: nextStatus === 'delivered' ? 'delivery' : nextStatus === 'shipped' ? 'shipping' : 'order_status',
-        titleEn: `Order ${existing.orderNumber}: ${label.en}`,
-        titleBn: `অর্ডার ${existing.orderNumber}: ${label.bn}`,
-        bodyEn: trackingCode
-          ? `Your order status is now ${label.en}. Tracking: ${trackingCode}`
-          : `Your order status has been updated to ${label.en}.`,
-        bodyBn: trackingCode
-          ? `আপনার অর্ডারের বর্তমান অবস্থা: ${label.bn}। ট্র্যাকিং কোড: ${trackingCode}`
-          : `আপনার অর্ডারের অবস্থা আপডেট হয়ে "${label.bn}" হয়েছে।`,
-        orderNumber: existing.orderNumber,
-      });
+      await createUserNotification(
+        existing.userId,
+        {
+          type: nextStatus === 'delivered' ? 'delivery' : nextStatus === 'shipped' ? 'shipping' : 'order_status',
+          titleEn: `Order ${existing.orderNumber}: ${label.en}`,
+          titleBn: `অর্ডার ${existing.orderNumber}: ${label.bn}`,
+          bodyEn: trackingCode
+            ? `Your order status is now ${label.en}. Tracking: ${trackingCode}`
+            : `Your order status has been updated to ${label.en}.`,
+          bodyBn: trackingCode
+            ? `আপনার অর্ডারের বর্তমান অবস্থা: ${label.bn}। ট্র্যাকিং কোড: ${trackingCode}`
+            : `আপনার অর্ডারের অবস্থা আপডেট হয়ে "${label.bn}" হয়েছে।`,
+          orderNumber: existing.orderNumber,
+        },
+        db
+      );
     }
 
     if (manualReconciliationNote && nextPaymentStatus !== existing.paymentStatus) {
@@ -1780,7 +1929,7 @@ app.post('/api/admin/orders/:orderId/update', requireAdmin(['super_admin', 'admi
         actorEmail: req.authUser!.email,
         timestamp: nowIso,
       });
-      await adminDb.collection('payments').doc(existing.orderNumber).set(
+      await db.collection('payments').doc(existing.orderNumber).set(
         {
           id: existing.orderNumber,
           orderId,
@@ -1798,7 +1947,7 @@ app.post('/api/admin/orders/:orderId/update', requireAdmin(['super_admin', 'admi
     }
 
     if (timelineEntries.length > 0) {
-      updates.timeline = FieldValue.arrayUnion(...timelineEntries);
+      updates.timeline = ServerFieldValue.arrayUnion(...timelineEntries);
     }
 
     // Automatic stock restoration if order moves into cancelled or returned (and not already restored)
@@ -1808,13 +1957,16 @@ app.post('/api/admin/orders/:orderId/update', requireAdmin(['super_admin', 'admi
       !existing.stockRestored;
 
     if (shouldRestoreStock) {
-      await adminDb.runTransaction(async (tx) => {
+      await db.runTransaction(async (tx) => {
         for (const item of existing.items || []) {
-          const pRef = adminDb.collection('products').doc(item.productId);
-          tx.update(pRef, {
-            stock: FieldValue.increment(Number(item.quantity || 1)),
-            updatedAt: nowIso,
-          });
+          const pRef = db.collection('products').doc(item.productId);
+          const pSnap = await tx.get(pRef);
+          if (pSnap.exists) {
+            tx.update(pRef, {
+              stock: ServerFieldValue.increment(Number(item.quantity || 1)),
+              updatedAt: nowIso,
+            });
+          }
         }
         tx.update(ref, { ...updates, stockRestored: true });
       });
@@ -1837,8 +1989,9 @@ app.post('/api/admin/orders/:orderId/update', requireAdmin(['super_admin', 'admi
 
 app.delete('/api/admin/orders/:orderId', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const orderId = sanitizeText(req.params.orderId, 128);
-    const ref = adminDb.collection('orders').doc(orderId);
+    const ref = db.collection('orders').doc(orderId);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(404).json({ error: 'Order not found' });
@@ -1861,11 +2014,12 @@ app.delete('/api/admin/orders/:orderId', requireAdmin(['super_admin', 'admin']),
   }
 });
 
-app.get('/api/admin/customers', requireAdmin(['super_admin', 'admin', 'order_manager']), async (_req, res) => {
+app.get('/api/admin/customers', requireAdmin(['super_admin', 'admin', 'order_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const [usersSnap, ordersSnap] = await Promise.all([
-      adminDb.collection('users').get(),
-      adminDb.collection('orders').get(),
+      db.collection('users').get(),
+      db.collection('orders').get(),
     ]);
     const orders = ordersSnap.docs.map((d) => d.data());
     const customers = usersSnap.docs.map((d) => {
@@ -1883,13 +2037,14 @@ app.get('/api/admin/customers', requireAdmin(['super_admin', 'admin', 'order_man
   }
 });
 
-app.get('/api/admin/customers/:uid/details', requireAdmin(['super_admin', 'admin', 'order_manager']), async (req, res) => {
+app.get('/api/admin/customers/:uid/details', requireAdmin(['super_admin', 'admin', 'order_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const uid = sanitizeText(req.params.uid, 128);
     const [userSnap, addrSnap, ordersSnap] = await Promise.all([
-      adminDb.collection('users').doc(uid).get(),
-      adminDb.collection('users').doc(uid).collection('addresses').get(),
-      adminDb.collection('orders').where('userId', '==', uid).get(),
+      db.collection('users').doc(uid).get(),
+      db.collection('users').doc(uid).collection('addresses').get(),
+      db.collection('orders').where('userId', '==', uid).get(),
     ]);
     if (!userSnap.exists) {
       res.status(404).json({ error: 'Customer not found' });
@@ -1915,6 +2070,7 @@ app.get('/api/admin/customers/:uid/details', requireAdmin(['super_admin', 'admin
 
 app.post('/api/admin/customers/:uid/update', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const uid = sanitizeText(req.params.uid, 128);
     const isActive = req.body?.isActive;
     const fullName = req.body?.fullName !== undefined ? sanitizeText(req.body.fullName, 120) : undefined;
@@ -1924,19 +2080,21 @@ app.post('/api/admin/customers/:uid/update', requireAdmin(['super_admin', 'admin
     const updates: Record<string, any> = { updatedAt: new Date().toISOString() };
     if (typeof isActive === 'boolean') {
       updates.isActive = isActive;
-      await adminAuth.updateUser(uid, { disabled: !isActive }).catch(() => {});
+      if (await canUseAdminSdk()) {
+        await adminAuth.updateUser(uid, { disabled: !isActive }).catch(() => {});
+      }
     }
     if (fullName) updates.fullName = fullName;
     if (phone !== undefined) updates.phone = phone;
     if (email) updates.email = email;
 
-    await adminDb.collection('users').doc(uid).set(updates, { merge: true });
+    await db.collection('users').doc(uid).set(updates, { merge: true });
 
     // Address CRUD for admin
     if (req.body?.addressAction === 'upsert' && req.body?.address) {
       const a = req.body.address;
-      const addrId = sanitizeText(a.id, 128) || adminDb.collection('users').doc(uid).collection('addresses').doc().id;
-      await adminDb
+      const addrId = sanitizeText(a.id, 128) || db.collection('users').doc(uid).collection('addresses').doc().id;
+      await db
         .collection('users')
         .doc(uid)
         .collection('addresses')
@@ -1953,7 +2111,7 @@ app.post('/api/admin/customers/:uid/update', requireAdmin(['super_admin', 'admin
           isDefault: Boolean(a.isDefault),
         });
     } else if (req.body?.addressAction === 'delete' && req.body?.addressId) {
-      await adminDb.collection('users').doc(uid).collection('addresses').doc(sanitizeText(req.body.addressId, 128)).delete();
+      await db.collection('users').doc(uid).collection('addresses').doc(sanitizeText(req.body.addressId, 128)).delete();
     }
 
     await writeAuditLog(req, 'CUSTOMER_UPDATED', `Updated customer profile/status (${uid})`, uid);
@@ -1965,9 +2123,10 @@ app.post('/api/admin/customers/:uid/update', requireAdmin(['super_admin', 'admin
 });
 
 // Server-Backed Product Management (with Stock History & Audit Logs)
-app.get('/api/admin/products', requireAdmin(['super_admin', 'admin', 'product_manager', 'order_manager']), async (_req, res) => {
+app.get('/api/admin/products', requireAdmin(['super_admin', 'admin', 'product_manager', 'order_manager']), async (req: AuthedRequest, res) => {
   try {
-    const snap = await adminDb.collection('products').get();
+    const db = await getServerDb(req.authToken);
+    const snap = await db.collection('products').get();
     const products = snap.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .sort((a: any, b: any) => String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')));
@@ -2044,7 +2203,8 @@ app.post('/api/admin/products', requireAdmin(['super_admin', 'admin', 'product_m
       updatedAt: nowIso,
     };
 
-    await adminDb.collection('products').doc(id).set(payload);
+    const db = await getServerDb(req.authToken);
+    await db.collection('products').doc(id).set(payload);
     await writeAuditLog(req, 'PRODUCT_CREATED', `Created product ${nameEn} (${sku})`, id);
     res.json({ ok: true, product: payload });
   } catch (err) {
@@ -2055,8 +2215,9 @@ app.post('/api/admin/products', requireAdmin(['super_admin', 'admin', 'product_m
 
 app.put('/api/admin/products/:id', requireAdmin(['super_admin', 'admin', 'product_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const id = sanitizeText(req.params.id, 128);
-    const ref = adminDb.collection('products').doc(id);
+    const ref = db.collection('products').doc(id);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(404).json({ error: 'Product not found' });
@@ -2113,14 +2274,17 @@ app.put('/api/admin/products/:id', requireAdmin(['super_admin', 'admin', 'produc
 
     await ref.set(updated);
     if (nextStock <= Number(updated.lowStockThreshold || 5)) {
-      await createAdminNotification({
-        type: 'low_stock',
-        titleEn: `Low Stock Alert: ${updated.nameEn}`,
-        titleBn: `সীমিত স্টক সতর্কতা: ${updated.nameBn}`,
-        bodyEn: `SKU ${updated.sku} now has ${nextStock} unit(s) left.`,
-        bodyBn: `SKU ${updated.sku}-এ মাত্র ${nextStock}টি পণ্য বাকি।`,
-        recordId: id,
-      });
+      await createAdminNotification(
+        {
+          type: 'low_stock',
+          titleEn: `Low Stock Alert: ${updated.nameEn}`,
+          titleBn: `সীমিত স্টক সতর্কতা: ${updated.nameBn}`,
+          bodyEn: `SKU ${updated.sku} now has ${nextStock} unit(s) left.`,
+          bodyBn: `SKU ${updated.sku}-এ মাত্র ${nextStock}টি পণ্য বাকি।`,
+          recordId: id,
+        },
+        db
+      );
     }
     await writeAuditLog(req, 'PRODUCT_UPDATED', `Updated product ${updated.nameEn} (${updated.sku})`, id);
     res.json({ ok: true, product: updated });
@@ -2132,8 +2296,9 @@ app.put('/api/admin/products/:id', requireAdmin(['super_admin', 'admin', 'produc
 
 app.delete('/api/admin/products/:id', requireAdmin(['super_admin', 'admin', 'product_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const id = sanitizeText(req.params.id, 128);
-    const ref = adminDb.collection('products').doc(id);
+    const ref = db.collection('products').doc(id);
     const snap = await ref.get();
     if (!snap.exists) {
       res.status(404).json({ error: 'Product not found' });
@@ -2149,15 +2314,20 @@ app.delete('/api/admin/products/:id', requireAdmin(['super_admin', 'admin', 'pro
   }
 });
 
-app.get('/api/admin/gateways', requireAdmin(['super_admin', 'admin']), async (_req, res) => {
+app.get('/api/admin/gateways', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const [pubSnap, privSnap, paymentsSnap] = await Promise.all([
-      adminDb.collection('settings').doc('payment_gateways_public').get(),
-      adminDb.collection('settings_private').doc('payment_gateways').get(),
-      adminDb.collection('payments').get(),
+      db.collection('settings').doc('payment_gateways_public').get(),
+      db
+        .collection('settings_private')
+        .doc('payment_gateways')
+        .get()
+        .catch(() => ({ exists: false, data: () => ({} as Record<string, any>) })),
+      db.collection('payments').get(),
     ]);
     const pub = pubSnap.exists ? pubSnap.data() : SEED_GATEWAY_FLAGS;
-    const priv = privSnap.exists ? privSnap.data() || {} : {};
+    const priv: Record<string, any> = privSnap.exists ? privSnap.data() || {} : {};
     res.json({
       publicFlags: pub,
       configured: {
@@ -2181,9 +2351,10 @@ app.get('/api/admin/gateways', requireAdmin(['super_admin', 'admin']), async (_r
 
 app.post('/api/admin/gateways', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const body = req.body || {};
     if (body.publicFlags) {
-      await adminDb.collection('settings').doc('payment_gateways_public').set(body.publicFlags, { merge: true });
+      await db.collection('settings').doc('payment_gateways_public').set(body.publicFlags, { merge: true });
     }
     if (body.credentials && req.adminRole === 'super_admin') {
       const c = body.credentials;
@@ -2202,7 +2373,7 @@ app.post('/api/admin/gateways', requireAdmin(['super_admin', 'admin']), async (r
       if (c.nagadPrivateKey) secretUpdate.nagadPrivateKey = sanitizeText(c.nagadPrivateKey, 4000);
       if (typeof c.nagadSandbox === 'boolean') secretUpdate.nagadSandbox = c.nagadSandbox;
       if (Object.keys(secretUpdate).length) {
-        await adminDb.collection('settings_private').doc('payment_gateways').set(secretUpdate, { merge: true });
+        await db.collection('settings_private').doc('payment_gateways').set(secretUpdate, { merge: true });
       }
     }
     await writeAuditLog(req, 'GATEWAY_SETTINGS_UPDATED', 'Updated payment gateway flags/credentials');
@@ -2215,13 +2386,14 @@ app.post('/api/admin/gateways', requireAdmin(['super_admin', 'admin']), async (r
 
 app.post('/api/admin/payments/:paymentId/refund', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const paymentId = sanitizeText(req.params.paymentId, 128);
     const refundReason = sanitizeText(req.body?.refundReason, 300);
     if (!refundReason) {
       res.status(400).json({ error: 'Refund reason is required' });
       return;
     }
-    const pRef = adminDb.collection('payments').doc(paymentId);
+    const pRef = db.collection('payments').doc(paymentId);
     const pSnap = await pRef.get();
     if (!pSnap.exists) {
       res.status(404).json({ error: 'Transaction record not found' });
@@ -2236,13 +2408,13 @@ app.post('/api/admin/payments/:paymentId/refund', requireAdmin(['super_admin', '
       refundedAt: nowIso,
     });
     if (pData.orderId) {
-      const oRef = adminDb.collection('orders').doc(pData.orderId);
+      const oRef = db.collection('orders').doc(pData.orderId);
       const oSnap = await oRef.get();
       if (oSnap.exists) {
         const order = oSnap.data()!;
         await oRef.update({
           paymentStatus: 'refunded',
-          timeline: FieldValue.arrayUnion({
+          timeline: ServerFieldValue.arrayUnion({
             status: order.orderStatus,
             titleEn: 'Payment Refunded',
             titleBn: 'পেমেন্ট রিফান্ড সম্পন্ন',
@@ -2253,14 +2425,18 @@ app.post('/api/admin/payments/:paymentId/refund', requireAdmin(['super_admin', '
           }),
           updatedAt: nowIso,
         });
-        await createUserNotification(order.userId, {
-          type: 'payment_confirmation',
-          titleEn: `Refund Issued: ${order.orderNumber}`,
-          titleBn: `রিফান্ড সম্পন্ন: ${order.orderNumber}`,
-          bodyEn: `A refund for ৳${pData.amount} has been processed (${refundReason}).`,
-          bodyBn: `আপনার ৳${pData.amount} টাকার রিফান্ড প্রক্রিয়া সম্পন্ন হয়েছে।`,
-          orderNumber: order.orderNumber,
-        });
+        await createUserNotification(
+          order.userId,
+          {
+            type: 'payment_confirmation',
+            titleEn: `Refund Issued: ${order.orderNumber}`,
+            titleBn: `রিফান্ড সম্পন্ন: ${order.orderNumber}`,
+            bodyEn: `A refund for ৳${pData.amount} has been processed (${refundReason}).`,
+            bodyBn: `আপনার ৳${pData.amount} টাকার রিফান্ড প্রক্রিয়া সম্পন্ন হয়েছে।`,
+            orderNumber: order.orderNumber,
+          },
+          db
+        );
       }
     }
     await writeAuditLog(req, 'PAYMENT_REFUNDED', `Issued refund for ${paymentId}: ${refundReason}`, paymentId);
@@ -2274,6 +2450,7 @@ app.post('/api/admin/payments/:paymentId/refund', requireAdmin(['super_admin', '
 // Audited Category, Coupon, Shipping & Site Settings Endpoints
 app.post('/api/admin/categories', requireAdmin(['super_admin', 'admin', 'product_manager']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const b = req.body || {};
     const nameEn = sanitizeText(b.nameEn, 120);
     const nameBn = sanitizeText(b.nameBn, 120);
@@ -2283,7 +2460,7 @@ app.post('/api/admin/categories', requireAdmin(['super_admin', 'admin', 'product
     }
     const slug = (sanitizeText(b.slug, 120) || nameEn).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
     const id = sanitizeText(b.id, 120) || slug;
-    await adminDb.collection('categories').doc(id).set({
+    await db.collection('categories').doc(id).set({
       id,
       slug,
       nameEn,
@@ -2301,14 +2478,21 @@ app.post('/api/admin/categories', requireAdmin(['super_admin', 'admin', 'product
 });
 
 app.delete('/api/admin/categories/:id', requireAdmin(['super_admin', 'admin', 'product_manager']), async (req: AuthedRequest, res) => {
-  const id = sanitizeText(req.params.id, 128);
-  await adminDb.collection('categories').doc(id).delete();
-  await writeAuditLog(req, 'CATEGORY_DELETED', `Deleted category ${id}`, id);
-  res.json({ ok: true });
+  try {
+    const db = await getServerDb(req.authToken);
+    const id = sanitizeText(req.params.id, 128);
+    await db.collection('categories').doc(id).delete();
+    await writeAuditLog(req, 'CATEGORY_DELETED', `Deleted category ${id}`, id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Category delete error:', err);
+    res.status(500).json({ error: 'Failed to delete category' });
+  }
 });
 
 app.post('/api/admin/coupons', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const b = req.body || {};
     const code = sanitizeText(b.code, 40).toUpperCase();
     if (!code) {
@@ -2316,7 +2500,7 @@ app.post('/api/admin/coupons', requireAdmin(['super_admin', 'admin']), async (re
       return;
     }
     const id = sanitizeText(b.id, 128) || `coupon-${code.toLowerCase()}`;
-    await adminDb.collection('coupons').doc(id).set(
+    await db.collection('coupons').doc(id).set(
       {
         id,
         code,
@@ -2340,15 +2524,22 @@ app.post('/api/admin/coupons', requireAdmin(['super_admin', 'admin']), async (re
 });
 
 app.delete('/api/admin/coupons/:id', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
-  const id = sanitizeText(req.params.id, 128);
-  await adminDb.collection('coupons').doc(id).delete();
-  await writeAuditLog(req, 'COUPON_DELETED', `Deleted coupon ${id}`, id);
-  res.json({ ok: true });
+  try {
+    const db = await getServerDb(req.authToken);
+    const id = sanitizeText(req.params.id, 128);
+    await db.collection('coupons').doc(id).delete();
+    await writeAuditLog(req, 'COUPON_DELETED', `Deleted coupon ${id}`, id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Coupon delete error:', err);
+    res.status(500).json({ error: 'Failed to delete coupon' });
+  }
 });
 
 app.post('/api/admin/shipping', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
-    await adminDb.collection('settings').doc('shipping').set(req.body || {}, { merge: true });
+    const db = await getServerDb(req.authToken);
+    await db.collection('settings').doc('shipping').set(req.body || {}, { merge: true });
     await writeAuditLog(req, 'SHIPPING_UPDATED', 'Updated shipping & delivery rules');
     res.json({ ok: true });
   } catch (err) {
@@ -2359,7 +2550,8 @@ app.post('/api/admin/shipping', requireAdmin(['super_admin', 'admin']), async (r
 
 app.post('/api/admin/site-settings', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
-    await adminDb.collection('settings').doc('site').set(req.body || {}, { merge: true });
+    const db = await getServerDb(req.authToken);
+    await db.collection('settings').doc('site').set(req.body || {}, { merge: true });
     await writeAuditLog(req, 'CMS_SETTINGS_UPDATED', 'Updated website CMS content & global settings');
     res.json({ ok: true });
   } catch (err) {
@@ -2368,13 +2560,20 @@ app.post('/api/admin/site-settings', requireAdmin(['super_admin', 'admin']), asy
   }
 });
 
-app.get('/api/admin/staff', requireAdmin(['super_admin']), async (_req, res) => {
-  const snap = await adminDb.collection('admins').get();
-  res.json({ staff: snap.docs.map((d) => ({ uid: d.id, ...d.data() })) });
+app.get('/api/admin/staff', requireAdmin(['super_admin']), async (req: AuthedRequest, res) => {
+  try {
+    const db = await getServerDb(req.authToken);
+    const snap = await db.collection('admins').get();
+    res.json({ staff: snap.docs.map((d) => ({ uid: d.id, ...d.data() })) });
+  } catch (err) {
+    console.error('Admin staff load error:', err);
+    res.status(500).json({ error: 'Failed to load staff roles' });
+  }
 });
 
 app.post('/api/admin/staff', requireAdmin(['super_admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const email = sanitizeText(req.body?.email, 160).toLowerCase();
     const role = sanitizeText(req.body?.role, 40);
     const active = req.body?.active !== false;
@@ -2382,22 +2581,34 @@ app.post('/api/admin/staff', requireAdmin(['super_admin']), async (req: AuthedRe
       res.status(400).json({ error: 'Valid email and role required' });
       return;
     }
-    let userRecord;
-    try {
-      userRecord = await adminAuth.getUserByEmail(email);
-    } catch {
+    let targetUid: string | null = null;
+    if (await canUseAdminSdk()) {
+      try {
+        const userRecord = await adminAuth.getUserByEmail(email);
+        targetUid = userRecord.uid;
+      } catch {
+        targetUid = null;
+      }
+    }
+    if (!targetUid) {
+      const userSnap = await db.collection('users').where('email', '==', email).limit(1).get();
+      if (!userSnap.empty) {
+        targetUid = String(userSnap.docs[0].data()?.uid || userSnap.docs[0].id);
+      }
+    }
+    if (!targetUid) {
       res.status(404).json({ error: 'User must sign in or register an account first before assigning an admin role.' });
       return;
     }
-    await adminDb.collection('admins').doc(userRecord.uid).set({
-      uid: userRecord.uid,
+    await db.collection('admins').doc(targetUid).set({
+      uid: targetUid,
       email,
       role,
       active,
       updatedAt: new Date().toISOString(),
     });
-    await writeAuditLog(req, 'STAFF_ROLE_UPDATED', `Assigned role ${role} (active: ${active}) to ${email}`, userRecord.uid);
-    res.json({ ok: true, uid: userRecord.uid });
+    await writeAuditLog(req, 'STAFF_ROLE_UPDATED', `Assigned role ${role} (active: ${active}) to ${email}`, targetUid);
+    res.json({ ok: true, uid: targetUid });
   } catch (err) {
     console.error('Admin staff save error:', err);
     res.status(500).json({ error: 'Failed to assign staff role' });
@@ -2407,6 +2618,7 @@ app.post('/api/admin/staff', requireAdmin(['super_admin']), async (req: AuthedRe
 // Send Promo Notification to all registered users (Admin)
 app.post('/api/admin/notifications/broadcast', requireAdmin(['super_admin', 'admin']), async (req: AuthedRequest, res) => {
   try {
+    const db = await getServerDb(req.authToken);
     const titleEn = sanitizeText(req.body?.titleEn, 200);
     const titleBn = sanitizeText(req.body?.titleBn, 200);
     const bodyEn = sanitizeText(req.body?.bodyEn, 600);
@@ -2416,11 +2628,11 @@ app.post('/api/admin/notifications/broadcast', requireAdmin(['super_admin', 'adm
       res.status(400).json({ error: 'All bilingual title and message fields are required' });
       return;
     }
-    const usersSnap = await adminDb.collection('users').get();
-    const batch = adminDb.batch();
+    const usersSnap = await db.collection('users').get();
+    const batch = db.batch();
     const nowIso = new Date().toISOString();
     usersSnap.docs.forEach((u) => {
-      const ref = adminDb.collection('users').doc(u.id).collection('notifications').doc();
+      const ref = db.collection('users').doc(u.id).collection('notifications').doc();
       batch.set(ref, { type, titleEn, titleBn, bodyEn, bodyBn, read: false, createdAt: nowIso });
     });
     await batch.commit();

@@ -67,10 +67,11 @@ service cloud.firestore {
     // Validation Helpers (Anti-Update-Gap)
     function isValidCategory(data) {
       return data.keys().hasAll(['slug', 'nameEn', 'nameBn']) &&
-        data.keys().hasOnly(['slug', 'nameEn', 'nameBn', 'parentId', 'image', 'sortOrder', 'updatedAt', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'slug', 'nameEn', 'nameBn', 'parentId', 'image', 'sortOrder', 'updatedAt', 'createdAt']) &&
         data.slug is string && data.slug.size() >= 1 && data.slug.size() <= 120 &&
         data.nameEn is string && data.nameEn.size() >= 1 && data.nameEn.size() <= 120 &&
         data.nameBn is string && data.nameBn.size() >= 1 && data.nameBn.size() <= 120 &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
         (!('parentId' in data) || (data.parentId is string && data.parentId.size() <= 128)) &&
         (!('image' in data) || (data.image is string && data.image.size() <= 500)) &&
         (!('sortOrder' in data) || data.sortOrder is number);
@@ -88,7 +89,7 @@ service cloud.firestore {
         data.stock is number && data.stock >= 0 &&
         data.published is bool &&
         (!('images' in data) || (data.images is list && data.images.size() <= 12)) &&
-        (!('sizes' in data) || (data.sizes is list && data.sizes.size() <= 15)) &&
+        (!('sizes' in data) || (data.sizes is list && data.sizes.size() <= 20)) &&
         (!('colors' in data) || (data.colors is list && data.colors.size() <= 15));
     }
 
@@ -106,12 +107,13 @@ service cloud.firestore {
 
     function isValidAddress(data) {
       return data.keys().hasAll(['fullName', 'phone', 'district', 'upazila', 'streetAddress']) &&
-        data.keys().hasOnly(['label', 'fullName', 'phone', 'district', 'upazila', 'deliveryArea', 'streetAddress', 'isDefault', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'label', 'fullName', 'phone', 'district', 'upazila', 'deliveryArea', 'streetAddress', 'isDefault', 'createdAt', 'updatedAt']) &&
         data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
         data.phone is string && data.phone.size() >= 6 && data.phone.size() <= 30 &&
         data.district is string && data.district.size() >= 1 && data.district.size() <= 80 &&
         data.upazila is string && data.upazila.size() >= 1 && data.upazila.size() <= 80 &&
         data.streetAddress is string && data.streetAddress.size() >= 3 && data.streetAddress.size() <= 300 &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
         (!('label' in data) || (data.label is string && data.label.size() <= 60)) &&
         (!('deliveryArea' in data) || (data.deliveryArea is string && data.deliveryArea.size() <= 120)) &&
         (!('isDefault' in data) || data.isDefault is bool);
@@ -136,7 +138,8 @@ service cloud.firestore {
 
     function isValidCoupon(data) {
       return data.keys().hasAll(['code', 'type', 'value', 'active']) &&
-        data.keys().hasOnly(['code', 'type', 'value', 'minOrderAmount', 'maxDiscount', 'usageLimit', 'usedCount', 'expiresAt', 'active', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'code', 'type', 'value', 'minOrderAmount', 'maxDiscount', 'usageLimit', 'usedCount', 'expiresAt', 'active', 'createdAt', 'updatedAt']) &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
         data.code is string && data.code.size() >= 2 && data.code.size() <= 40 &&
         data.type in ['percentage', 'fixed'] &&
         data.value is number && data.value > 0 &&
@@ -148,6 +151,57 @@ service cloud.firestore {
         data.keys().hasOnly(['email', 'createdAt']) &&
         data.email is string && data.email.size() >= 5 && data.email.size() <= 160 &&
         data.createdAt == request.time;
+    }
+
+    function isValidOrderCreate(data) {
+      return data.keys().hasAll(['id', 'orderNumber', 'userId', 'customerName', 'customerPhone', 'items', 'subtotal', 'deliveryCharge', 'grandTotal', 'paymentMethod', 'paymentStatus', 'orderStatus']) &&
+        data.userId == request.auth.uid &&
+        data.orderNumber is string && data.orderNumber.size() >= 4 && data.orderNumber.size() <= 40 &&
+        data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 120 &&
+        data.customerPhone is string && data.customerPhone.size() >= 6 && data.customerPhone.size() <= 30 &&
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 30 &&
+        data.subtotal is number && data.subtotal >= 0 &&
+        data.deliveryCharge is number && data.deliveryCharge >= 0 &&
+        data.grandTotal is number && data.grandTotal >= 0 &&
+        data.orderStatus == 'pending';
+    }
+
+    function isValidPayment(data) {
+      return data.keys().hasAll(['orderId', 'orderNumber', 'gateway', 'amount', 'status']) &&
+        data.orderId is string && data.orderId.size() <= 128 &&
+        data.orderNumber is string && data.orderNumber.size() <= 40 &&
+        data.gateway is string && data.gateway.size() <= 40 &&
+        data.amount is number && data.amount >= 0 &&
+        data.status is string && data.status.size() <= 40;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['type', 'titleEn', 'titleBn', 'bodyEn', 'bodyBn', 'read']) &&
+        data.type is string && data.type.size() <= 40 &&
+        data.titleEn is string && data.titleEn.size() <= 200 &&
+        data.titleBn is string && data.titleBn.size() <= 200 &&
+        data.bodyEn is string && data.bodyEn.size() <= 600 &&
+        data.bodyBn is string && data.bodyBn.size() <= 600 &&
+        data.read is bool;
+    }
+
+    function isValidAdminNotification(data) {
+      return data.keys().hasAll(['type', 'titleEn', 'titleBn', 'bodyEn', 'bodyBn', 'read']) &&
+        data.type is string && data.type.size() <= 40 &&
+        data.titleEn is string && data.titleEn.size() <= 200 &&
+        data.titleBn is string && data.titleBn.size() <= 200 &&
+        data.bodyEn is string && data.bodyEn.size() <= 600 &&
+        data.bodyBn is string && data.bodyBn.size() <= 600 &&
+        data.read is bool;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['adminUid', 'adminEmail', 'actionType', 'description', 'timestamp']) &&
+        data.adminUid == request.auth.uid &&
+        data.adminEmail is string && data.adminEmail.size() <= 160 &&
+        data.actionType is string && data.actionType.size() <= 80 &&
+        data.description is string && data.description.size() <= 600 &&
+        data.timestamp is string && data.timestamp.size() <= 60;
     }
 
     // Categories
@@ -162,7 +216,11 @@ service cloud.firestore {
     match /products/{productId} {
       allow get: if isValidId(productId) && (existing().published == true || canManageProducts());
       allow list: if resource.data.published == true || canManageProducts();
-      allow create, update: if isValidId(productId) && canManageProducts() && isValidProduct(incoming());
+      allow create: if isValidId(productId) && canManageProducts() && isValidProduct(incoming());
+      allow update: if isValidId(productId) && isValidProduct(incoming()) && (
+        canManageProducts() ||
+        (isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'soldCount', 'updatedAt']))
+      );
       allow delete: if isValidId(productId) && canManageProducts();
     }
 
@@ -173,16 +231,28 @@ service cloud.firestore {
       allow create, update, delete: if isValidId(settingId) && isAdmin() && (adminRole() in ['super_admin', 'admin']);
     }
 
-    // Private Settings (gateway secret config — server/super admin only)
+    // Private Settings (gateway secret config — super admin only)
     match /settings_private/{settingId} {
       allow read, write: if isSuperAdmin();
     }
 
-    // Coupons (admin managed; customers validate via server API)
+    // Coupons (exact ID get allowed for validation; list/write admin managed; signed-in checkout increments usedCount)
     match /coupons/{couponId} {
-      allow read: if isAdmin();
-      allow create, update: if isValidId(couponId) && isAdmin() && (adminRole() in ['super_admin', 'admin']) && isValidCoupon(incoming());
+      allow get: if isValidId(couponId);
+      allow list: if isAdmin();
+      allow create: if isValidId(couponId) && isAdmin() && (adminRole() in ['super_admin', 'admin']) && isValidCoupon(incoming());
+      allow update: if isValidId(couponId) && isValidCoupon(incoming()) && (
+        (isAdmin() && (adminRole() in ['super_admin', 'admin'])) ||
+        (isSignedIn() &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['usedCount']) &&
+          incoming().usedCount == existing().usedCount + 1)
+      );
       allow delete: if isValidId(couponId) && isAdmin() && (adminRole() in ['super_admin', 'admin']);
+    }
+
+    // Phone OTP Verification Records (owner-only)
+    match /phone_otps/{uid} {
+      allow get, create, update, delete: if isValidId(uid) && isOwner(uid);
     }
 
     // Users & Subcollections (Strict PII Isolation)
@@ -196,7 +266,7 @@ service cloud.firestore {
         (isOwner(userId) &&
           incoming().uid == existing().uid &&
           incoming().isActive == existing().isActive &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'email', 'phone', 'photoUrl', 'updatedAt'])) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'email', 'phone', 'phoneVerified', 'photoUrl', 'updatedAt'])) ||
         isAdmin()
       );
       allow delete: if isValidId(userId) && isSuperAdmin();
@@ -222,23 +292,35 @@ service cloud.firestore {
           incoming().diff(existing()).affectedKeys().hasOnly(['read']) &&
           incoming().read is bool;
         allow delete: if isValidId(notifId) && (isOwner(userId) || isAdmin());
-        allow create: if isValidId(notifId) && isAdmin();
+        allow create: if isValidId(notifId) && (isAdmin() || isOwner(userId)) && isValidNotification(incoming());
       }
     }
 
-    // Orders (Read by owner or admin; Created & Mutated strictly by server Admin SDK or Order Admin)
+    // Orders (Read by owner or admin; Created by signed-in owner; Mutated by order admin or owner cancel)
     match /orders/{orderId} {
       allow get: if isValidId(orderId) && (canManageOrders() || (isSignedIn() && existing().userId == request.auth.uid));
       allow list: if canManageOrders() || (isSignedIn() && resource.data.userId == request.auth.uid);
-      allow update: if isValidId(orderId) && canManageOrders();
-      allow create, delete: if false; // Enforced via server-side API to validate prices/coupons/payment
+      allow create: if isValidId(orderId) && isSignedIn() && isValidOrderCreate(incoming());
+      allow update: if isValidId(orderId) && (
+        canManageOrders() ||
+        (isSignedIn() &&
+          existing().userId == request.auth.uid &&
+          existing().orderStatus in ['pending', 'confirmed'] &&
+          incoming().orderStatus == 'cancelled' &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['orderStatus', 'stockRestored', 'timeline', 'updatedAt']))
+      );
+      allow delete: if isValidId(orderId) && isAdmin() && (adminRole() in ['super_admin', 'admin']) &&
+        (existing().orderStatus == 'cancelled' || existing().paymentStatus == 'failed');
     }
 
-    // Payments (Read by owner or admin; Written strictly by server payment verification)
+    // Payments (Read by owner or admin; Admin reconciles/refunds; Owner initiates)
     match /payments/{paymentId} {
       allow get: if isValidId(paymentId) && (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
       allow list: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
-      allow write: if false; // Server-side payment verification only
+      allow create, update: if isValidId(paymentId) && isValidPayment(incoming()) && (
+        (isAdmin() && (adminRole() in ['super_admin', 'admin', 'order_manager'])) ||
+        (isSignedIn() && incoming().userId == request.auth.uid && incoming().status == 'initiated')
+      );
     }
 
     // Reviews
@@ -266,14 +348,16 @@ service cloud.firestore {
     // Admin Notifications
     match /admin_notifications/{notifId} {
       allow read: if isAdmin();
+      allow create: if isValidId(notifId) && isSignedIn() && isValidAdminNotification(incoming());
       allow update: if isValidId(notifId) && isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['read']) && incoming().read is bool;
-      allow create, delete: if false;
+      allow delete: if isValidId(notifId) && isAdmin();
     }
 
-    // Audit Logs
+    // Audit Logs (Immutable once created)
     match /audit_logs/{logId} {
       allow read: if isAdmin();
-      allow write: if false;
+      allow create: if isValidId(logId) && isAdmin() && isValidAuditLog(incoming());
+      allow update, delete: if false;
     }
   }
 }
